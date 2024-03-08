@@ -235,6 +235,7 @@ def evaluate_last_timestep(model=None, val_loader=None, device=None, criterion=N
     y_test = []
     y_test_ge = []
     y_test_le = []
+    error_set = []
     model.eval()
     with torch.no_grad():
         # No age
@@ -249,6 +250,8 @@ def evaluate_last_timestep(model=None, val_loader=None, device=None, criterion=N
                 h = h.to(device)
                 out, h = model(local_batch.float(), h.float())
                 y_pred_tag = torch.round(torch.sigmoid(out.squeeze()))
+                if y_pred_tag != local_labels:
+                    error_set.append(ID[0])
                 if basis is not None:
                     q1 = torch.quantile(centering + weight @ basis.T, 0.25, interpolation='nearest').item()
                     q4 = torch.quantile(centering + weight @ basis.T, 0.75, interpolation='nearest').item()
@@ -285,6 +288,8 @@ def evaluate_last_timestep(model=None, val_loader=None, device=None, criterion=N
                         'loss': (loss + l1_regularizer(model, lambda_l1=0.001, weight_or_bias='weight')).detach().numpy(),
                         'acc>0.5': accuracy_score(y_test_ge, y_pred_list_ge),
                         'acc<0.5': accuracy_score(y_test_le, y_pred_list_le),
+                        'bacc>0.5': balanced_accuracy_score(y_test_ge, y_pred_list_ge),
+                        'bacc<0.5': balanced_accuracy_score(y_test_le, y_pred_list_le),
                         'predictions': y_pred_list,
                         'labels': y_test,
                         'subject_id': subj_id_list}
@@ -298,7 +303,9 @@ def evaluate_last_timestep(model=None, val_loader=None, device=None, criterion=N
                 'auc': metrics.roc_auc_score(y_test, y_pred_auc),
                 'loss': (loss + l1_regularizer(model, lambda_l1=0.001, weight_or_bias='weight')).detach().numpy(),
                 'predictions': y_pred_list,
-                'labels': y_test}
+                'labels': y_test,
+                'error_set': error_set
+                }
     #print(results_dict)
     return results_dict
 
@@ -409,7 +416,7 @@ def evaluate_last_timestep_shap(model=None, val_loader=None, device=None, criter
     #print(results_dict)
     return results_dict
 
-
+# Meta-weighting baseline
 def train_gru_mod(model=None, criterion=None, optimizer=None, max_epochs=30, train_loader=None, val_loader=None, device=None, seq2seq=True, params=None, batch_size=None, scheduler=None \
                   , meta_loader=None):
     # Loop over epochs
@@ -530,7 +537,7 @@ def train_gru_mod(model=None, criterion=None, optimizer=None, max_epochs=30, tra
     plot = {'epoch': plot_epoch, 'train_acc': plot_train_acc, 'val_acc': plot_val_acc, 'train_loss': plot_loss, 'val_loss': plot_val_loss}
     return model, h, plot, weight_loopup
 
-def train_gru(model=None, criterion=None, optimizer=None, max_epochs=30, train_loader=None, val_loader=None, device=None, seq2seq=True, params=None, batch_size=None, scheduler=None):
+def train_gru(model=None, criterion=None, optimizer=None, max_epochs=30, train_loader=None, val_loader=None, device=None, seq2seq=True, params=None, batch_size=None, scheduler=None, jtt=None):
     # Loop over epochs
     plot_epoch = []
     plot_train_acc = []
@@ -595,7 +602,12 @@ def train_gru(model=None, criterion=None, optimizer=None, max_epochs=30, train_l
         plot_val_loss.append(result['loss'])
         scheduler.step()
     plot = {'epoch': plot_epoch, 'train_acc': plot_train_acc, 'val_acc': plot_val_acc, 'train_loss': plot_loss, 'val_loss': plot_val_loss}
-    return model, h, plot
+
+    if jtt is not None:
+        result_train = evaluate_last_timestep(model=model, val_loader=train_loader, device=device, criterion=criterion)
+        return model, h, plot, result_train['error_set']
+    else:
+        return model, h, plot
 
 
 class ModelWrapper(nn.Module):

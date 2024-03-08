@@ -9,6 +9,7 @@ from train_test_utils import *
 from tabulate import tabulate
 import warnings
 import matplotlib.pyplot as plt
+import csv
 warnings.filterwarnings('ignore')
 
 run_with_seed = 1964 #random.randint(0, 4294967295)
@@ -29,6 +30,8 @@ additional = load_longitudinal_tabular_data(input_path=additional_path, write_pa
 # Because this variable should not be used
 input_feats = input_feats.drop(columns=['aces_total'])
 
+input_feats = input_feats[input_feats['subject']!= 'NCANDA_S00835']
+
 # We are predicting age and construct in a multi-task setting
 age = False
 plot_flag = True
@@ -36,6 +39,9 @@ plot_flag = True
 seq2seq = False
 batch_size = 25
 additional_val = False
+meta_weight = True
+jtt = False
+round_1 = False
 
 # age_range = [12, 18]
 # sex = 2
@@ -90,6 +96,9 @@ for key in list(np.unique(input_feats.loc[:, 'subject'])):
 # Since if we are predicting the age as a task we don't use it as an input feature
 if age:
     input_feats = input_feats.drop(columns=['visit_age'])
+
+input_feats = input_feats.drop(columns=['sex','ses_parent_yoe'])
+
 # We are doing 5-fold cross validation se we are creating dictionaries to save the data for each fold
 partition = {}
 folds = {}
@@ -190,7 +199,8 @@ df_list = []
 results_additional = {}
 
 # Train models for each fold
-
+weights = {}
+weight_lookup_total = {}
 for fold in folds.keys():
 
     # Get the data per fold
@@ -201,9 +211,38 @@ for fold in folds.keys():
     labels_test_f = folds_of_the_labels_test[fold]
     ages_f = folds_of_the_ages[fold]
 
+    if jtt and not round_1:
+        upsample_list = pd.read_csv(f"error_set_{fold}.csv", names=['Subjects'])
+        upsample_list = upsample_list['Subjects'].values.tolist()
+
+        upsampled_train = partition['train'] + upsample_list
+
+        non_upsampled_list = list(set(partition['train']) - set(upsample_list))
+
+        weights_list = list(zip(upsample_list, [2] * len(upsample_list)))
+        weights_list += list(zip(non_upsampled_list, [1] * len(non_upsampled_list)))
+        weights[f'split{fold}'] = weights_list
+    else:
+        upsampled_train = partition['train']
+        non_upsampled_list = upsampled_train
+
     # Dataset generators
-    training_set = Dataset(partition['train'], subject_post, labels_train_f, ages_f, age)
+    training_set = Dataset(upsampled_train, subject_post, labels_train_f, ages_f, age)
     training_generator = torch.utils.data.DataLoader(training_set, **params)
+
+    # # So we can test the accuracy specifically on the upsampled test
+    # upsample_set = Dataset(upsample_list, subject_post, labels_train_f, ages_f, age)
+    # upsample_generator = torch.utils.data.DataLoader(upsample_set, **params)
+    #
+    # non_upsample_set = Dataset(non_upsampled_list, subject_post, labels_train_f, ages_f, age)
+    # non_upsample_generator = torch.utils.data.DataLoader(non_upsample_set, **params)
+
+    if meta_weight:
+        shuffle_params = {'shuffle': True,
+                          'num_workers': 0,
+                          'batch_size': 1}  # One batch contains all the visits of each subject
+
+        meta_generator = torch.utils.data.DataLoader(training_set, **shuffle_params)
 
     validation_set = Dataset(partition['test'], subject_post, labels_test_f, ages_f, age)
     validation_generator = torch.utils.data.DataLoader(validation_set, **params)
@@ -212,7 +251,12 @@ for fold in folds.keys():
     
     # The parameters I trained with, after hyperparameter tuning
     epoch = 0
-    max_epochs = 100
+    if jtt and not round_1:
+        max_epochs = 80
+    elif meta_weight:
+        max_epochs = 30
+    else:
+        max_epochs = 100
 
     feature_dim = 128
     input_dim = next(iter(training_generator))[0].shape[2]
@@ -229,8 +273,8 @@ for fold in folds.keys():
                           n_layers=n_layers, seq2seq=seq2seq, device=device, drop_prob=0)
 
     # Loss chosen for binary classification task
-    score_criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pos_weight).float().to(device))
-    # score_criterion = nn.BCEWithLogitsLoss()
+    # score_criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pos_weight).float().to(device))
+    score_criterion = nn.BCEWithLogitsLoss()
 
     if age:
         # Loss chosen for age prediction
@@ -241,8 +285,13 @@ for fold in folds.keys():
     else:
         criterion = score_criterion
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.0001, weight_decay=0.01)
-    scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[30], gamma=0.1)
+    if meta_weight:
+        weight_lookup = {}
+        for i, subject in enumerate(partition['train']):
+            weight_lookup[subject] = i
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=0.01)
+    scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[100], gamma=0.1)
     model.to(device)
 
     model.train()
@@ -250,26 +299,59 @@ for fold in folds.keys():
     if age:
         model_trained, h, plot = train_gru_age(model=model, criterion=criterion, optimizer=optimizer, max_epochs=max_epochs,
                                          train_loader=training_generator, val_loader=validation_generator,
-                                         device=device, seq2seq=seq2seq, params=params, batch_size=batch_size)
-    else:
+                                         device=device, seq2seq=seq2seq, params=params, batch_size=batch_size, jtt=None)
+    elif jtt and round_1:
+        model_trained, h, plot, error_train_set = train_gru(model=model, criterion=criterion, optimizer=optimizer, max_epochs=max_epochs,
+                                           train_loader=training_generator, val_loader=validation_generator,
+                                           device=device, seq2seq=seq2seq, params=params, batch_size=batch_size,
+                                           scheduler=scheduler, jtt=True)
+    elif meta_weight is False and round_1 is False:
         model_trained, h, plot = train_gru(model=model, criterion=criterion, optimizer=optimizer, max_epochs=max_epochs,
                                          train_loader=training_generator, val_loader=validation_generator,
-                                         device=device, seq2seq=seq2seq, params=params, batch_size=batch_size, scheduler=scheduler)
-    if plot_flag:               
+                                         device=device, seq2seq=seq2seq, params=params, batch_size=batch_size, scheduler=scheduler, jtt=None)
+    elif meta_weight:
+        model_trained, h, plot, weight_lookup = train_gru_mod(model=model, criterion=criterion, optimizer=optimizer, max_epochs=max_epochs,
+                                           train_loader=training_generator, val_loader=validation_generator,
+                                           device=device, seq2seq=seq2seq, params=shuffle_params, batch_size=batch_size,
+                                           scheduler=scheduler, meta_loader=meta_generator)
+
+    if meta_weight:
+        for subject in weight_lookup:
+            if subject in weight_lookup_total.keys():
+                weight_lookup_total[subject] += weight_lookup[subject] / 4
+            else:
+                weight_lookup_total[subject] = weight_lookup[subject] / 4
+
+    if plot_flag:
         fig, ax = plt.subplots()
         ax.plot(plot['epoch'], plot['train_loss'], label='train')
         ax.plot(plot['epoch'], plot['val_loss'], label='validation')
         ax.set(xlabel='epoch', ylabel='loss',
             title='traning curve fold {}'.format(fold))
         ax.legend()
-        fig.savefig("./plots/train_curve{}.png".format(fold)) 
+        fig.savefig("./plots/train_curve{}_meta_weight_3_4.png".format(fold))
     
     # Path to save the models
     if age:
         output_path = f'{construct}_fold_{fold}_tabular_no_aces.ckpt'
     else:
-        output_path = f'{construct}_fold_{fold}_tabular_no_aces_no_age.ckpt'
-    
+        output_path = f'{construct}_fold_{fold}_tabular_no_aces_no_age_meta_weight_3_4.ckpt'
+
+    if jtt and round_1:
+        file = open(f'error_set_{fold}.csv', 'w+', newline='')
+        with file:
+            write = csv.writer(file)
+            for line in error_train_set:
+                file.write(f"{line}\n")
+            # write.writerows(error_train_set)
+
+    # Write the weights assigned to the train subjects of that fold
+    if jtt and not round_1:
+        file = open(f'weights_{fold}_jtt.csv', 'w+', newline='')
+        with file:
+            write = csv.writer(file)
+            write.writerows(weights[f'split{fold}'])
+
     print(f'Model training complete for fold {fold} complete.')
     # Uncomment to save models
     #torch.save(model_trained.state_dict(), output_path)
@@ -287,6 +369,16 @@ for fold in folds.keys():
             results_additional[f'split{fold}'] = evaluate_last_timestep(model=model_trained, val_loader=additional_validation_generator, device=device, criterion=criterion)
     df = pd.DataFrame.from_dict({k:v for k,v in results[f'split{fold}'].items() if k in ['subject', 'probabilities', 'true_values']})
     df_list.append(df)
+
+    data_lookup = read_csv('./graph_factors_raw.csv', separator=',')
+    data = np.zeros((400, 3))
+    c = np.zeros((400,))
+    i = 0
+    if meta_weight:
+        for subject in weight_lookup_total:
+            c[i] = weight_lookup_total[subject]
+            data[i] = data_lookup[data_lookup['subject'] == subject][['sex', 'ses', 'fh']].values
+            i += 1
 
 def output_results(results):
     avg_results_dict = {}
@@ -314,10 +406,18 @@ def output_results(results):
     avg_results_dict['f1-score'] = avg_f1 / len(folds.keys())
     avg_results_dict['confusion_matrix'] = avg_confusion_matrix / len(folds.keys())
     avg_results_dict['auc'] = avg_auc / len(folds.keys())
-    acc_1 = [results[key]['balanced_accuracy'] for key in results.keys()]
 
+    acc = [results[key]['accuracy'] for key in results.keys()]
+    bacc = [results[key]['balanced_accuracy'] for key in results.keys()]
+    f1 = [results[key]['f1-score'] for key in results.keys()]
+    auc = [results[key]['auc'] for key in results.keys()]
 
-    print(torch.std(torch.tensor(acc_1)).item())
+    print(f'Accuracy: {torch.mean(torch.tensor(acc)).item():.3f} +- {torch.std(torch.tensor(acc)).item():.3f}')
+    print(
+        f'Balanced Accuracy: {torch.mean(torch.tensor(bacc)).item():.3f} +- {torch.std(torch.tensor(bacc)).item():.3f}')
+    print(f'F1-score: {torch.mean(torch.tensor(f1)).item():.3f} +- {torch.std(torch.tensor(f1)).item():.3f}')
+    print(f'AUC: {torch.mean(torch.tensor(auc)).item():.3f} +- {torch.std(torch.tensor(auc)).item():.3f}')
+
     return avg_results_dict
 # Average the results over the 5 folds and print the metrics
 
@@ -325,4 +425,14 @@ print(f'Average results for {construct}:')
 print(output_results(results))
 if additional_val:
     print(output_results(results_additional))
+
+print('Results per fold:')
+
+print('Balanced Accuracy')
+for key in results.keys():
+    print(results[key]['balanced_accuracy'])
+
+print('F1 Score')
+for key in results.keys():
+    print(results[key]['f1-score'])
 

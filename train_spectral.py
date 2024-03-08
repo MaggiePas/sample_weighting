@@ -49,10 +49,10 @@ additional_val = False
 # mode 1 is the model without the regularization term on the eigenvalues
 mode = 1
 # ablation study for number of neighbors
-knn = 30
+knn = 50
 # number of eigenbasis vectors to use
 k = 13
-centering = 0.75
+centering = 0.65
 max_epochs = 100
 weight_lr = 1e-5
 model_lr = 1e-4
@@ -62,30 +62,10 @@ plot_val = True
 plot_train = True
 construct = 'cahalan_score_y'
 
-# Load in additional validation
-# if additional_val:
-#     scaler = MinMaxScaler(feature_range=(-1,1))
-#     additional = additional.drop(columns=['aces_total'])
-#     partition_additional = list(np.unique(additional.loc[:, 'subject']))
-#     additional['cahalan_score_x'] = additional['cahalan_score_x'].replace(1, 0)
-#     X_additional = additional.iloc[:, 3:]
-#     X_additional = X_additional.drop(columns='cahalan_score_y')
-#     X_additional = scaler.fit_transform(X_additional)
-#     X_additional = pd.DataFrame(data=X_additional, columns=additional.columns[3:-1])
-#     X_additional = X_additional.set_index(additional.index)
-#     X_additional.insert(0, 'subject', additional.loc[:, 'subject'], True)
-#     labels_additional = {}
-#     subject_additional = {}
-#     params = {'shuffle': True,
-#             'num_workers': 0,
-#             'batch_size': 1}
-#     for key in partition_additional:
-#         subj_v_add = additional[additional['subject'] == key]
-#         subj_visits_add = X_additional[X_additional['subject'] == key]    
-#         labels_additional[key] = subj_v_add.loc[:, construct]
-#         subject_additional[key] = subj_visits_add.iloc[:, 1:]
-#     additional_validation_set = Dataset(partition_additional, subject_additional, labels_additional, {}, age)
-#     additional_validation_generator = torch.utils.data.DataLoader(additional_validation_set, **params)
+only_graph_factors = False
+
+if only_graph_factors:
+    weight_lr = 0
 
 # preprocessing for spectral method implementation
 basis = read_csv(f'./neighbour_ablation/eigenvectors_ncanda_lower_pert_knn_{knn}.csv', separator=',')
@@ -286,6 +266,10 @@ for fold in folds.keys():
     else:
         criterion = score_criterion
     weight = torch.rand(k, requires_grad=True)
+
+    if only_graph_factors:
+        weight = torch.ones(k, requires_grad=True)
+
     optimizer = torch.optim.Adam([ {'params': model.parameters()}, {'params': weight, 'lr': weight_lr}], lr=model_lr, weight_decay=0.01)
     scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[100], gamma=1)
     model.to(device)
@@ -619,6 +603,8 @@ def output_results(results):
     subj_macro_acc = 0.0
     avg_acc_high = 0.0
     avg_acc_low = 0.0
+    avg_bacc_high = 0.0
+    avg_bacc_low = 0.0
     all_predictions = []
     all_labels = []
     all_IDs = []
@@ -632,6 +618,8 @@ def output_results(results):
         avg_confusion_matrix += results[key]['confusion_matrix']
         avg_acc_high += results[key]['acc>0.5']
         avg_acc_low += results[key]['acc<0.5']
+        avg_bacc_high += results[key]['bacc>0.5']
+        avg_bacc_low += results[key]['bacc<0.5']
         avg_auc += results[key]['auc']
         all_predictions.append(results[key]['predictions'])
         all_labels.append(results[key]['labels'])
@@ -646,11 +634,15 @@ def output_results(results):
     avg_results_dict['subject_macro_accuracy'] = subj_macro_acc / len(folds.keys())
     avg_results_dict['high_acc'] = avg_acc_high / len(folds.keys())
     avg_results_dict['low_acc'] = avg_acc_low / len(folds.keys())
+    avg_results_dict['high_bacc'] = avg_bacc_high / len(folds.keys())
+    avg_results_dict['low_bacc'] = avg_bacc_low / len(folds.keys())
 
     acc_0 = [results[key]['accuracy'] for key in results.keys()]
     acc_1 = [results[key]['balanced_accuracy'] for key in results.keys()]
     acc_2 = [results[key]['acc>0.5'] for key in results.keys()]
     acc_3 = [results[key]['acc<0.5'] for key in results.keys()]
+    bacc_2 = [results[key]['bacc>0.5'] for key in results.keys()]
+    bacc_3 = [results[key]['bacc<0.5'] for key in results.keys()]
     f1 = [results[key]['f1-score'] for key in results.keys()]
     auc = [results[key]['auc'] for key in results.keys()]
 
@@ -661,6 +653,8 @@ def output_results(results):
     print(f'AUC: {torch.mean(torch.tensor(auc)).item():.3f} +- {torch.std(torch.tensor(auc)).item():.3f}')
     print(f'Acc > {centering}: {torch.mean(torch.tensor(acc_2)).item():.3f} +- {torch.std(torch.tensor(acc_2)).item():.3f}')
     print(f'Acc < {centering}: {torch.mean(torch.tensor(acc_3)).item():.3f} +- {torch.std(torch.tensor(acc_3)).item():.3f}')
+    print(f'BACC > {centering}: {torch.mean(torch.tensor(bacc_2)).item():.3f} +- {torch.std(torch.tensor(bacc_2)).item():.3f}')
+    print(f'BACC < {centering}: {torch.mean(torch.tensor(bacc_3)).item():.3f} +- {torch.std(torch.tensor(bacc_3)).item():.3f}')
 
     all_labels = [item for sublist in all_labels for item in sublist]
     all_predictions = [item for sublist in all_predictions for item in sublist]
@@ -704,6 +698,14 @@ for key in results.keys():
     print(results[key]['acc>0.5'])
 
 print('ACC<0.5')
+for key in results.keys():
+    print(results[key]['acc<0.5'])
+
+print('BACC>0.5')
+for key in results.keys():
+    print(results[key]['acc>0.5'])
+
+print('BACC<0.5')
 for key in results.keys():
     print(results[key]['acc<0.5'])
 
